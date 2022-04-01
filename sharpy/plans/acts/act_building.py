@@ -1,4 +1,5 @@
 import math
+from typing import Optional
 
 import sc2
 from sc2.ids.unit_typeid import UnitTypeId
@@ -11,12 +12,13 @@ from .act_base import ActBase
 class ActBuilding(ActBase):
     """Act of starting to build new buildings up to specified count"""
 
-    def __init__(self, unit_type: UnitTypeId, to_count: int = 1):
+    def __init__(self, unit_type: UnitTypeId, to_count: int = 1, override_reserved: bool = False):
         assert unit_type is not None and isinstance(unit_type, UnitTypeId)
         assert to_count is not None and isinstance(to_count, int)
 
         self.unit_type = unit_type
         self.to_count = to_count
+        self.override_reserved = override_reserved
 
         super().__init__()
 
@@ -29,7 +31,7 @@ class ActBuilding(ActBase):
         unit = self.ai._game_data.units[self.unit_type.value]
         cost = self.ai._game_data.calculate_ability_cost(unit.creation_ability)
 
-        if self.knowledge.can_afford(self.unit_type):
+        if self.knowledge.can_afford(self.unit_type, override_reserved=self.override_reserved):
             await self.actually_build(self.ai, count)
         else:
             self.knowledge.reserve(cost.minerals, cost.vespene)

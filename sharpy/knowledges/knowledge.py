@@ -31,6 +31,21 @@ root_logger = logging.getLogger()
 TManager = TypeVar("TManager")
 
 
+class ResourceReservation:
+    """Simple structure for """
+    def __init__(self, minerals: int, gas: int, delay: float, unit_type: UnitTypeId = None):
+        self.minerals: int = minerals
+        self.gas: int = gas
+        self.delay: float = delay
+        self.unit_type: UnitTypeId = unit_type
+
+    def __lt__(self, other: 'ResourceReservation'):
+        return self.delay < other.delay
+
+    def __repr__(self):
+        return(f'ResourceReservation(m:{self.minerals} g:{self.gas} d:{self.delay:.1f} u:{self.unit_type})')
+
+
 class Knowledge:
     my_worker_type: UnitTypeId
 
@@ -48,6 +63,8 @@ class Knowledge:
         self.iteration: int = 0
         self.reserved_minerals: int = 0
         self.reserved_gas: int = 0
+        self.resource_reservations: List[ResourceReservation] = []
+        self.resource_reservation_lookahead = 60
         self.log_manager: ILogManager = LogManager()
         # TODO: Remove references to these managers
         self.lag_handler: Optional[ILagHandler] = None
@@ -156,6 +173,7 @@ class Knowledge:
         self.iteration = iteration
         self.reserved_minerals = 0
         self.reserved_gas = 0
+        self.resource_reservations = []
 
         for manager in self.managers:
             await manager.update()
@@ -171,16 +189,38 @@ class Knowledge:
             self.lag_handler.step_took(ms_step)
 
     @property
-    def available_mineral(self) -> int:
+    def available_minerals(self) -> int:
         return self.ai.minerals - self.reserved_minerals
 
     @property
     def available_gas(self) -> int:
         return self.ai.vespene - self.reserved_gas
 
-    def reserve(self, minerals: int, gas: int):
-        self.reserved_minerals += minerals
-        self.reserved_gas += gas
+    def recalculate_reserved_minerals(self):
+        """Simulation of resource income/spending based on reservations"""
+        self.resource_reservations.sort()
+        current_t: float = 0.0
+        current_minerals = self.ai.minerals
+        current_gas = self.ai.vespene
+        min_minerals = current_minerals
+        min_gas = current_gas
+        calculator = self.get_required_manager(IncomeCalculator)
+        for reservation in self.resource_reservations:
+            if reservation.delay > self.resource_reservation_lookahead:
+                break
+            current_minerals += (reservation.delay - current_t) * calculator.mineral_income - reservation.minerals
+            current_gas += (reservation.delay - current_t) * calculator.gas_income - reservation.gas
+            current_t = reservation.delay
+            min_minerals = min(min_minerals, current_minerals)
+            min_gas = min(min_gas, current_gas)
+        available_minerals = int(min_minerals)
+        available_gas = int(min_gas)
+        self.reserved_minerals = self.ai.minerals - available_minerals
+        self.reserved_gas = self.ai.vespene - available_gas
+
+    def reserve(self, minerals: int, gas: int, delay: float = 0.0, unit_id: Optional[UnitTypeId] = None):
+        self.resource_reservations.append(ResourceReservation(minerals, gas, delay, unit_id))
+        self.recalculate_reserved_minerals()
 
     def reserve_costs(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId]):
         if isinstance(item_id, UnitTypeId):
@@ -192,7 +232,8 @@ class Knowledge:
             cost = self.ai._game_data.calculate_ability_cost(item_id)
         self.reserve(cost.minerals, cost.vespene)
 
-    def can_afford(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId], check_supply_cost: bool = True) -> bool:
+    def can_afford(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId], check_supply_cost: bool = True,
+                   override_reserved: bool = False) -> bool:
         """Tests if the player has enough resources to build a unit or cast an ability even after reservations."""
         enough_supply = True
         if isinstance(item_id, UnitTypeId):
@@ -204,9 +245,27 @@ class Knowledge:
             cost = self.ai._game_data.upgrades[item_id.value].cost
         else:
             cost = self.ai._game_data.calculate_ability_cost(item_id)
-        minerals = self.ai.minerals - self.reserved_minerals
-        gas = self.ai.vespene - self.reserved_gas
+        minerals = self.ai.minerals
+        gas = self.ai.vespene
+        if not override_reserved:
+            minerals -= self.reserved_minerals
+            gas -= self.reserved_gas
         return cost.minerals <= minerals and cost.vespene <= max(0, gas) and enough_supply
+
+    def prerequisite_progress(self, unit_type: UnitTypeId):
+        zerg_prereq = ZERG_TECH_REQUIREMENT[unit_type]
+        terran_prereq = TERRAN_TECH_REQUIREMENT[unit_type]
+        protoss_prereq = PROTOSS_TECH_REQUIREMENT[unit_type]
+        if zerg_prereq is not UnitTypeId.NOTAUNIT:
+            prereq = zerg_prereq
+        elif terran_prereq is not UnitTypeId.NOTAUNIT:
+            prereq = terran_prereq
+        elif protoss_prereq is not UnitTypeId.NOTAUNIT:
+            prereq = protoss_prereq
+        else:
+            return 1.0
+        progresses = [unit.build_progress for unit in self.unit_cache.own(prereq)]
+        return max(progresses) if progresses else 0.0
 
     def print(self, message: string, tag: string = None, stats: bool = True, log_level=logging.INFO):
         """
