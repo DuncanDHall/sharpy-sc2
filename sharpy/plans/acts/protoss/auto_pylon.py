@@ -7,8 +7,8 @@ from sc2.ids.unit_typeid import UnitTypeId
 class AutoPylon(GridBuilding):
     """Builds pylons automatically when needed based on predicted supply growth speed."""
 
-    def __init__(self):
-        super().__init__(UnitTypeId.PYLON, 0)
+    def __init__(self, override_reserved: bool = False):
+        super().__init__(UnitTypeId.PYLON, 0, override_reserved=override_reserved)
 
     async def execute(self):
         self.to_count = await self.pylon_count_calc()

@@ -8,15 +8,17 @@ from sharpy.plans.acts.workers import Workers
 class AutoWorker(ActBase):
     act: ActBase
 
-    def __init__(self, to_count=80, notready_count=8) -> None:
+    def __init__(self, to_count=80, notready_count=8, override_reserved: bool = False) -> None:
         super().__init__()
         self.notready_count = notready_count
         self.to_count = to_count
+        self.override_reserved = override_reserved
 
     async def start(self, knowledge: "Knowledge"):
         await super().start(knowledge)
         if self.knowledge.my_race == Race.Zerg:
-            self.act = ActUnit(UnitTypeId.DRONE, UnitTypeId.LARVA, self.to_count, True)
+            self.act = ActUnit(UnitTypeId.DRONE, UnitTypeId.LARVA, self.to_count,
+                               priority=True, override_reserved=self.override_reserved)
         else:
             self.act = Workers(self.to_count)
         await self.start_component(self.act, knowledge)

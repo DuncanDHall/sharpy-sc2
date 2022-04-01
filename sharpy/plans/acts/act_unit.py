@@ -1,3 +1,5 @@
+from typing import Optional
+
 from sc2.data import Race
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.unit import Unit
@@ -15,7 +17,8 @@ class ActUnit(ActBase):
     lost_units_manager: ILostUnitsManager
     income_calculator: IIncomeCalculator
 
-    def __init__(self, unit_type: UnitTypeId, from_building: UnitTypeId, to_count: int = 9999, priority: bool = False):
+    def __init__(self, unit_type: UnitTypeId, from_building: UnitTypeId, to_count: int = 9999, priority: bool = False,
+                 override_reserved: bool = False):
         assert unit_type is not None and isinstance(unit_type, UnitTypeId)
         assert from_building is not None and isinstance(from_building, UnitTypeId)
         assert to_count is not None and isinstance(to_count, int)
@@ -25,6 +28,7 @@ class ActUnit(ActBase):
         self.from_building = from_building
         self.to_count = to_count
         self.priority = priority
+        self.override_reserved = override_reserved
 
         super().__init__()
 
@@ -91,7 +95,8 @@ class ActUnit(ActBase):
         unit_data = self.ai._game_data.units[self.unit_type.value]
         cost = self.ai._game_data.calculate_ability_cost(unit_data.creation_ability)
 
-        if self.builders.ready.exists and self.knowledge.can_afford(unit_data.creation_ability):
+        if self.builders.ready.exists and self.knowledge.can_afford(unit_data.creation_ability,
+                                                                    override_reserved=self.override_reserved):
             for builder in self.builders.ready:
                 if self.has_order_ready(builder) and not builder.is_flying:
                     if builder.tag in self.ai.unit_tags_received_action:
