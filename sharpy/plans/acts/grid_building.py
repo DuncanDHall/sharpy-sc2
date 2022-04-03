@@ -72,6 +72,11 @@ class GridBuilding(ActBuilding):
     4. Building is pending (build order issued)
     5. Building started (building foundation has been laid)
     6. Building is completed
+
+    A worker is "assigned" to a site when it starts pre-moving by putting its
+    tag into self.planned_positions_workers as the value for a position key. A
+    worker is considered "active" while it is pre-moving, has a build order,
+    or is currently building (scv).
     """
     def __init__(
         self,
@@ -129,6 +134,8 @@ class GridBuilding(ActBuilding):
         # verify prerequisites in progress
         if self.knowledge.prerequisite_progress(self.unit_type) <= 0.0:
             return False
+        if self.unit_type == UnitTypeId.GATEWAY and self.get_count(UnitTypeId.PYLON) < 1:
+            return False
 
         # check if done
         existing_count = self.get_count(self.unit_type, include_pending=False, include_not_ready=True)
@@ -136,16 +143,27 @@ class GridBuilding(ActBuilding):
             return True  # Step is done
 
         # find and plan n valid positions
-        if self.potential_positions is None:
+        if not self.potential_positions:
             self.potential_positions = self.get_potential_positions()
         self.plan_positions()
 
-        # remove inactive builder tags and roles
         for builder_tag in list(self.active_builders):
             worker = self.cache.by_tag(builder_tag)
-            if worker is None or not self.has_build_order(worker):
-                self.active_builders.remove(builder_tag)  # if pre-moving, will be marked active before role update
+            # remove inactive builder tags and roles
+            if worker is None:
+                # worker died/morphed
+                self.active_builders.remove(builder_tag)
                 self.roles.clear_task(builder_tag)
+            elif not self.has_build_order(worker):
+                if self.multiple_builders:
+                    # one worker of N done building
+                    self.active_builders.remove(builder_tag)  # if pre-moving, will be marked active before role update
+                    self.roles.clear_task(builder_tag)
+                else:
+                    if not self.planned_positions_workers:
+                        # single worker done with all plans
+                        self.active_builders.remove(builder_tag)
+                        self.roles.clear_task(builder_tag)
 
         # proceed with the planned positions
         for position in list(self.planned_positions_workers):
@@ -161,7 +179,9 @@ class GridBuilding(ActBuilding):
                 elif self.worker_stuck.need_new_worker(worker, self.ai.time, position, self.knowledge.iteration):
                     self.print(f"Worker {worker.tag} was found stuck at {worker.position}!")
                     self.roles.set_task(UnitTask.Reserved, worker)  # Set temp reserved for the stuck worker
-                    self.planned_positions_workers[position] = None
+                    for pos, tag in self.planned_positions_workers:
+                        if tag == worker.tag:
+                            self.planned_positions_workers[pos] = None
             # use a temp worker
             if worker is None:
                 worker = self.get_worker_builder(position)
@@ -169,15 +189,18 @@ class GridBuilding(ActBuilding):
             if worker is None:
                 return False  # Cannot proceed
 
+            # if single worker, then will be already assigned an action in a previous loop
+            if worker.tag in self.ai.unit_tags_received_action:
+                # TODO make a timed resource reservation for the next building here, kinda complex
+                pass
             # try to build
-            if (
+            elif (
                     # can afford
                     self.knowledge.can_afford(self.unit_type, check_supply_cost=False,
                                               override_reserved=self.override_reserved)
                     # tech complete
                     and self.knowledge.prerequisite_progress(self.unit_type) >= 1
                     # No duplicate builds
-                    and worker.tag not in self.ai.unit_tags_received_action
                     and not self.has_build_order(worker)
                     # Psionic matrix ready
                     and (
@@ -194,13 +217,20 @@ class GridBuilding(ActBuilding):
                 self.active_builders.add(worker.tag)
                 # make sure it doesn't get selected for another position
                 self.roles.set_task(UnitTask.Building, worker)
+                # assign rest of planned buildings to the same worker
+                if not self.multiple_builders:
+                    for pos in self.planned_positions_workers:
+                        self.planned_positions_workers[pos] = worker.tag
 
             # pre-move worker and reserve resources
             elif self.priority and not self.has_build_order(worker):
                 # calculate earliest can build
+                # tech
                 tech_wait_time = self.prerequisite_completion_time()
+                # travel
                 d = worker.distance_to(position)
                 travel_time: float = d / to_new_ticks(worker.movement_speed)
+                # minerals/gas
                 cost = self.knowledge.ai.calculate_cost(self.unit_type)
                 adjusted_income = self.income_calculator.mineral_income * 0.93  # 14 / 15 = 0.933333
                 available_minerals = self.knowledge.ai.minerals if self.override_reserved else self.knowledge.available_minerals
@@ -209,13 +239,31 @@ class GridBuilding(ActBuilding):
                 available_gas = self.knowledge.ai.vespene if self.override_reserved else self.knowledge.available_gas
                 gas_to_collect = max(0.0, cost.vespene - available_gas)
                 gas_wait_time = gas_to_collect / max(self.income_calculator.gas_income, 0.01)
-                build_wait_time = max(travel_time, tech_wait_time, minerals_wait_time, gas_wait_time)
+                # psionic matrix
+                if self.knowledge.my_race == Race.Protoss and self.unit_type not in {UnitTypeId.PYLON,
+                                                                                     UnitTypeId.NEXUS}:
+                    pending_pylons = self.cache.own(UnitTypeId.PYLON).not_ready.closer_than(7.0, position)
+                    matrix_wait_time = min([(1 - p.build_progress) * 18.0 for p in pending_pylons] + [1000])
+                else:
+                    matrix_wait_time = 0.0
+                # max
+                build_wait_time = max(travel_time, tech_wait_time, minerals_wait_time, gas_wait_time, matrix_wait_time)
 
-                self.knowledge.reserve(cost.minerals, cost.vespene, build_wait_time, self.unit_type)
+                # make the reservation
+                if self.multiple_builders:
+                    self.knowledge.reserve(cost.minerals, cost.vespene, build_wait_time, self.unit_type)
+                else:
+                    # reserve additional resources for single worker
+                    for i in range(len(self.planned_positions_workers)):
+                        self.knowledge.reserve(cost.minerals, cost.vespene, build_wait_time + i, self.unit_type)
 
+                # assign the worker
                 if build_wait_time < travel_time + 0.1:
-                    # assign the worker
                     self.planned_positions_workers[position] = worker.tag
+                    if not self.multiple_builders:
+                        for pos in self.planned_positions_workers:
+                            self.planned_positions_workers[pos] = worker.tag
+                # pre-move and manage role
                 if self.planned_positions_workers[position] == worker.tag:  # separate condition prevents waffling
                     # track the worker for role maintenance
                     self.active_builders.add(worker.tag)

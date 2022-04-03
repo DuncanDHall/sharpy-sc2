@@ -32,18 +32,20 @@ TManager = TypeVar("TManager")
 
 
 class ResourceReservation:
-    """Simple structure for """
-    def __init__(self, minerals: int, gas: int, delay: float, unit_type: UnitTypeId = None):
+    """Simple structure for storing and sorting resource reservations"""
+    def __init__(self, minerals: int, gas: int, delay: float,
+                 item_id: Optional[Union[UnitTypeId, UpgradeId, AbilityId]] = None):
         self.minerals: int = minerals
         self.gas: int = gas
         self.delay: float = delay
-        self.unit_type: UnitTypeId = unit_type
+        self.item_id: Optional[Union[UnitTypeId, UpgradeId, AbilityId]] = item_id
 
     def __lt__(self, other: 'ResourceReservation'):
         return self.delay < other.delay
 
     def __repr__(self):
-        return(f'ResourceReservation(m:{self.minerals} g:{self.gas} d:{self.delay:.1f} u:{self.unit_type})')
+        return (f'ResourceReservation(m:{self.minerals} g:{self.gas} '
+                f'd:{self.delay:.1f} u:{self.item_id.name})')
 
 
 class Knowledge:
@@ -218,8 +220,9 @@ class Knowledge:
         self.reserved_minerals = self.ai.minerals - available_minerals
         self.reserved_gas = self.ai.vespene - available_gas
 
-    def reserve(self, minerals: int, gas: int, delay: float = 0.0, unit_id: Optional[UnitTypeId] = None):
-        self.resource_reservations.append(ResourceReservation(minerals, gas, delay, unit_id))
+    def reserve(self, minerals: int, gas: int, delay: float = 0.0,
+                item_id: Optional[Union[UnitTypeId, UpgradeId, AbilityId]] = None):
+        self.resource_reservations.append(ResourceReservation(minerals, gas, delay, item_id))
         self.recalculate_reserved_minerals()
 
     def reserve_costs(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId], delay: float = 0.0):
@@ -230,7 +233,7 @@ class Knowledge:
             cost = self.ai._game_data.upgrades[item_id.value].cost
         else:
             cost = self.ai._game_data.calculate_ability_cost(item_id)
-        self.reserve(cost.minerals, cost.vespene, delay)
+        self.reserve(cost.minerals, cost.vespene, delay, item_id)
 
     def can_afford(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId], check_supply_cost: bool = True,
                    override_reserved: bool = False) -> bool:
