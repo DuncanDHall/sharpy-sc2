@@ -15,39 +15,48 @@ class AutoPylon(GridBuilding):
         return await super().execute()
 
     async def pylon_count_calc(self) -> int:
-        growth_speed = 0
-        nexus_count = self.cache.own(UnitTypeId.NEXUS).ready.amount
+        pylon_build_duration = self.knowledge.ai.calculate_cost(UnitTypeId.PYLON).time
+        lookahead = pylon_build_duration + 3  # 2 seconds worker travel/buffer time
+        supply_prediction = self.ai.supply_used  # predicted in the next `lookahead` seconds
 
-        gate_count = self.cache.own(UnitTypeId.GATEWAY).ready.amount
-        gate_count += self.cache.own(UnitTypeId.WARPGATE).ready.amount
+        # Nexus probes
+        for production_structure in self.cache.own(UnitTypeId.NEXUS):
+            if self.time_till_idle(production_structure) < lookahead:
+                supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.PROBE)
+        # Nexus mothership
+        if self.cache.own(UnitTypeId.FLEETBEACON) and not self.cache.own(UnitTypeId.MOTHERSHIP):
+            supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.MOTHERSHIP)
+        # Gateway
+        for production_structure in self.cache.own(UnitTypeId.GATEWAY):
+            if self.time_till_idle(production_structure) < lookahead:
+                # all gateway units are 2 supply
+                supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.ZEALOT)
+        # Warp Gate - cannot tell cooldown progress easily, so we always assume they will be ready
+        for _ in self.cache.own(UnitTypeId.WARPGATE):
+            # all gateway units are 2 supply
+            supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.ZEALOT)
+        # Robotics Facility
+        for production_structure in self.cache.own(UnitTypeId.ROBOTICSFACILITY):
+            if self.time_till_idle(production_structure) < lookahead:
+                if self.cache.own(UnitTypeId.ROBOTICSBAY):
+                    supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.COLOSSUS)
+                else:
+                    supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.IMMORTAL)
+        # Stargate
+        for production_structure in self.cache.own(UnitTypeId.STARGATE):
+            if self.time_till_idle(production_structure) < lookahead:
+                if self.cache.own(UnitTypeId.FLEETBEACON):
+                    supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.CARRIER)
+                else:
+                    supply_prediction += self.knowledge.ai.calculate_supply_cost(UnitTypeId.VOIDRAY)
 
-        robo_count = self.cache.own(UnitTypeId.ROBOTICSFACILITY).ready.amount
-        stargate_count = self.cache.own(UnitTypeId.STARGATE).ready.amount
+        # correct for maxed
+        supply_prediction = min(supply_prediction, 200)
 
-        # Probes take 12 seconds to build
-        # https://liquipedia.net/starcraft2/Nexus_(Legacy_of_the_Void)
-        growth_speed += nexus_count / 12.0
-
-        # https://liquipedia.net/starcraft2/Warp_Gate_(Legacy_of_the_Void)
-        # fastest usage is zealot supply with 2 supply and warp in cooldown is 20 seconds
-        growth_speed += gate_count * 2 / 20.0
-
-        # https://liquipedia.net/starcraft2/Robotics_Facility_(Legacy_of_the_Void)
-        # fastest usage is immortal with 4 supply and build time of 39 seconds
-        growth_speed += robo_count * 4 / 39.0
-
-        # https://liquipedia.net/starcraft2/Stargate_(Legacy_of_the_Void)
-        # fastest usage is tempest with 5 supply and build time of 43 seconds
-        growth_speed += stargate_count * 5 / 43.0
-
-        growth_speed *= 1.2  # Just a little bit of margin of error
-        build_time = 18  # pylon build time
-        # build_time += min(self.ai.time / 60, 5) # probe walk time
-
-        predicted_supply = min(200, self.ai.supply_used + build_time * growth_speed)
-        current_pylons = self.cache.own(UnitTypeId.PYLON).ready.amount
-
-        if self.ai.supply_cap == 200:
-            return current_pylons
-
-        return ceil((predicted_supply - self.ai.supply_cap) / 8) + current_pylons
+        # correct for Nexus finishing soon
+        nexus_count: int = self.cache.own(UnitTypeId.NEXUS).ready.amount
+        for nexus_in_progress in self.cache.own(UnitTypeId.NEXUS).not_ready:
+            if self.time_till_idle(nexus_in_progress) < lookahead:
+                nexus_count += 1
+        pylon_to_count = ceil((supply_prediction - 15 * nexus_count) / 8)
+        return pylon_to_count
