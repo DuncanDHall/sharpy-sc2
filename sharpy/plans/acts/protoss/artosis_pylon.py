@@ -8,10 +8,10 @@ from sc2.position import Point2
 
 
 class ArtosisPylon(GridBuilding):
-    def __init__(self, to_count: int, iterator: Optional[int] = None, priority: bool = False):
-        super().__init__(UnitTypeId.PYLON, to_count, iterator, priority, False)
+    def __init__(self, to_count: int, position_iterator: Optional[int] = None, priority: bool = False):
+        super().__init__(UnitTypeId.PYLON, to_count, position_iterator, priority, False)
 
-    def position_protoss(self, count) -> Optional[Point2]:
+    def positions_protoss(self, count) -> Optional[Point2]:
         best_position = None
         buildings = self.knowledge.ai.structures
         best_count = 0

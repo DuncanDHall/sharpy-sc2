@@ -1,5 +1,5 @@
 from abc import abstractmethod, ABC
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from sc2.position import Point2
 
