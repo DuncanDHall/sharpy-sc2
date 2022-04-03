@@ -222,7 +222,7 @@ class Knowledge:
         self.resource_reservations.append(ResourceReservation(minerals, gas, delay, unit_id))
         self.recalculate_reserved_minerals()
 
-    def reserve_costs(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId]):
+    def reserve_costs(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId], delay: float = 0.0):
         if isinstance(item_id, UnitTypeId):
             unit = self.ai._game_data.units[item_id.value]
             cost = self.ai._game_data.calculate_ability_cost(unit.creation_ability)
@@ -230,7 +230,7 @@ class Knowledge:
             cost = self.ai._game_data.upgrades[item_id.value].cost
         else:
             cost = self.ai._game_data.calculate_ability_cost(item_id)
-        self.reserve(cost.minerals, cost.vespene)
+        self.reserve(cost.minerals, cost.vespene, delay)
 
     def can_afford(self, item_id: Union[UnitTypeId, UpgradeId, AbilityId], check_supply_cost: bool = True,
                    override_reserved: bool = False) -> bool:
