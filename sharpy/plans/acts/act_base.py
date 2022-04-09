@@ -262,8 +262,3 @@ class ActBase(Component, ABC):
             return True
         return False
 
-    def time_till_idle(self, unit: Unit) -> float:
-        if unit.is_ready:
-            return sum([order.ability.cost.time / 22.4 * (1 - order.progress) for order in unit.orders])
-        else:
-            return (1 - unit.build_progress) * self.unit_values.build_time(unit.type_id)

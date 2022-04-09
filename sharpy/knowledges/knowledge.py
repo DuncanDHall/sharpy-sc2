@@ -3,6 +3,8 @@ import string
 from configparser import ConfigParser
 from typing import List, Optional, Callable, Type, Union
 
+from sc2.unit import Unit
+
 from sc2.data import Race, Result
 from sharpy.events import UnitDestroyedEvent
 from sharpy.interfaces.data_manager import IDataManager
@@ -269,6 +271,12 @@ class Knowledge:
             return 1.0
         progresses = [unit.build_progress for unit in self.unit_cache.own(prereq)]
         return max(progresses) if progresses else 0.0
+
+    def time_until_idle(self, unit: Unit) -> float:
+        if unit.is_ready:
+            return sum([order.ability.cost.time / 22.4 * (1 - order.progress) for order in unit.orders])
+        else:
+            return (1 - unit.build_progress) * self.unit_values.build_time(unit.type_id)
 
     def print(self, message: string, tag: string = None, stats: bool = True, log_level=logging.INFO):
         """
