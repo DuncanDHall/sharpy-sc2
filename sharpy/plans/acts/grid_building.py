@@ -1,6 +1,5 @@
-from collections import OrderedDict
 from math import floor
-from typing import Optional, Set, Tuple, List, Dict, Callable
+from typing import Optional, Set
 
 from sc2.data import Race
 from sc2.ids.ability_id import AbilityId
@@ -12,7 +11,6 @@ from sharpy.utils import map_to_point2s_center
 from sc2.ids.unit_typeid import UnitTypeId
 from sc2.position import Point2
 from sc2.unit import Unit
-from sc2.constants import ZERG_TECH_REQUIREMENT, TERRAN_TECH_REQUIREMENT, PROTOSS_TECH_REQUIREMENT
 
 from .act_building import ActBuilding
 from sharpy.interfaces import IBuildingSolver, IIncomeCalculator
@@ -63,281 +61,158 @@ class WorkerStuckStatus:
 
 
 class GridBuilding(ActBuilding):
-    """Build buildings allowing the BuildingSolver to determine the locations
 
-    Each position goes through the following steps:
-    1. Unverified (will be checked and rejected if occupied, not on creep/psi-field, etc.)
-    2. Planned (a building location has been set)
-    3. Planned and Assigned (a worker has been assigned to the site)
-    4. Building is pending (build order issued)
-    5. Building started (building foundation has been laid)
-    6. Building is completed
+    building_solver: IBuildingSolver
+    income_calculator: IIncomeCalculator
+    pather: Optional[PathingManager]
+    last_iteration_moved: int
 
-    A worker is "assigned" to a site when it starts pre-moving by putting its
-    tag into self.planned_positions_workers as the value for a position key. A
-    worker is considered "active" while it is pre-moving, has a build order,
-    or is currently building (scv).
-    """
     def __init__(
         self,
         unit_type: UnitTypeId,
         to_count: int = 1,
+        iterator: Optional[int] = None,
         priority: bool = False,
         allow_wall: bool = True,
-        override_reserved: bool = False,
-        multiple_builders: Optional[bool] = None
+        consider_worker_production: bool = True,
     ):
-        """
-        :param unit_type: unit type to build
-        :param to_count: total count to build to (if to_count is 3 and you already have 1 then this will build 2 more)
-        :param position_iterator: used to skip positions in building solver
-        :param priority: if True will reserve resources and pre-move worker(s)
-        :param allow_wall: whether this building should be placed in available wall spaces
-        :param override_reserved: whether this build operation can spend reserved resources
-        :param multiple_builders: whether to use multiple builders in parallel
-        """
         super().__init__(unit_type, to_count)
+        self.allow_wall = allow_wall
         assert isinstance(priority, bool)
         self.priority = priority
-        self.allow_wall = allow_wall
-        self.override_reserved = override_reserved
-        self.multiple_builders = multiple_builders
-
+        self.builder_tag: Optional[int] = None
+        self.iterator: Optional[int] = iterator
+        self.consider_worker_production = consider_worker_production
+        self.building_solver: IBuildingSolver = None
+        self.make_pylon = None
+        self.last_iteration_moved = -10
         self.worker_stuck: WorkerStuckStatus = WorkerStuckStatus()
-        """For detecting workers that cannot move to their build site"""
-        self.building_solver: Optional[IBuildingSolver] = None
-        """Building solver to use"""
-        self.potential_positions: Optional[List[Point2]] = None  # (position, assigned builder_tag)
-        """Track all available positions for the building. Populated on start, and popped whenever a position is 
-        found to be invalid"""
-        self.active_builders: Set[int] = set()
-        """Builders who are pre-moving, moving to pending buildings, and actively building"""
-        self.planned_positions_workers: OrderedDict[Point2, Optional[int]] = OrderedDict()
-        """Tracks which positions have been planned and if a worker has been assigned"""
-        self.income_calculator: IIncomeCalculator = Optional[None]
-        """For predicting how long it will take to gather the required resources"""
-        self.pather: Optional[PathingManager] = None
-        """For pathing the workers"""
 
     async def start(self, knowledge: "Knowledge"):
         await super().start(knowledge)
-        if self.multiple_builders is None:
-            if self.knowledge.my_race == Race.Protoss:
-                self.multiple_builders = False
-            else:
-                self.multiple_builders = True
         self.building_solver = self.knowledge.get_required_manager(IBuildingSolver)
-        self.income_calculator = self.knowledge.get_required_manager(IIncomeCalculator)
         self.pather = self.knowledge.get_manager(PathingManager)
+        self.income_calculator = self.knowledge.get_required_manager(IIncomeCalculator)
+        if self.unit_type != UnitTypeId.PYLON:
+            self.make_pylon: Optional[GridBuilding] = GridBuilding(UnitTypeId.PYLON, 0, 2)
+            await self.make_pylon.start(knowledge)
 
     async def execute(self) -> bool:
-        # verify prerequisites in progress
-        if self.knowledge.prerequisite_progress(self.unit_type) <= 0.0:
-            return False
-        if self.unit_type == UnitTypeId.GATEWAY and self.get_count(UnitTypeId.PYLON) < 1:
-            return False
+        count = self.get_count(self.unit_type, include_pending=False, include_not_ready=True)
 
-        # check if done
-        existing_count = self.get_count(self.unit_type, include_pending=False, include_not_ready=True)
-        if existing_count >= self.to_count:
+        if count >= self.to_count:
+            if self.builder_tag is not None:
+                self.clear_worker()
+
             return True  # Step is done
 
-        # find and plan n valid positions
-        if not self.potential_positions:
-            self.potential_positions = self.get_potential_positions()
-        self.plan_positions()
+        if (
+            count + (self.pending_build(self.unit_type) - self.cache.own(self.unit_type).not_ready.amount)
+            >= self.to_count
+        ):
+            if self.builder_tag is not None:
+                worker = self.cache.by_tag(self.builder_tag)
+                if worker is not None:
+                    self.set_worker(worker)
+                    await self.debug_draw()
+            return True  # Building is ordered
 
-        for builder_tag in list(self.active_builders):
-            worker = self.cache.by_tag(builder_tag)
-            # remove inactive builder tags and roles
-            if worker is None:
-                # worker died/morphed
-                self.active_builders.remove(builder_tag)
-                self.roles.clear_task(builder_tag)
-            elif not self.has_build_order(worker):
-                if self.multiple_builders:
-                    # one worker of N done building
-                    self.active_builders.remove(builder_tag)  # if pre-moving, will be marked active before role update
-                    self.roles.clear_task(builder_tag)
-                else:
-                    if not self.planned_positions_workers:
-                        # single worker done with all plans
-                        self.active_builders.remove(builder_tag)
-                        self.roles.clear_task(builder_tag)
+        if self.knowledge.my_race == Race.Protoss:
+            position = self.position_protoss(count)
+        elif self.knowledge.my_race == Race.Terran:
+            position = self.position_terran(count)
+        else:
+            position = self.position_zerg(count)
 
-        # proceed with the planned positions
-        for position in list(self.planned_positions_workers):
+        if position is None:
+            if self.make_pylon is not None:
+                self.make_pylon.to_count = len(self.cache.own(UnitTypeId.PYLON).ready) + 1
+                await self.make_pylon.execute()
+            else:
+                self.print(f"Can't find free position to build {self.unit_type.name} in!")
+            return False  # Stuck and cannot proceed
 
-            # get worker unit
-            worker = None
-            if self.planned_positions_workers[position] is not None:
-                worker = self.cache.by_tag(self.planned_positions_workers[position])
-                # check worker died
-                if worker is None:
-                    self.planned_positions_workers[position] = None
-                # check worker is stuck
-                elif self.worker_stuck.need_new_worker(worker, self.ai.time, position, self.knowledge.iteration):
-                    self.print(f"Worker {worker.tag} was found stuck at {worker.position}!")
-                    self.roles.set_task(UnitTask.Reserved, worker)  # Set temp reserved for the stuck worker
-                    for pos, tag in self.planned_positions_workers:
-                        if tag == worker.tag:
-                            self.planned_positions_workers[pos] = None
-            # use a temp worker
-            if worker is None:
-                worker = self.get_worker_builder(position)
-            # no workers
-            if worker is None:
-                return False  # Cannot proceed
+        worker = self.get_worker_builder(position, self.builder_tag)  # type: Unit
 
-            # if single worker, then will be already assigned an action in a previous loop
-            if worker.tag in self.ai.unit_tags_received_action:
-                # TODO make a timed resource reservation for the next building here, kinda complex
-                pass
-            # try to build
-            elif (
-                    # can afford
-                    self.knowledge.can_afford(self.unit_type, check_supply_cost=False,
-                                              override_reserved=self.override_reserved)
-                    # tech complete
-                    and self.knowledge.prerequisite_progress(self.unit_type) >= 1
+        if worker is None:
+            self.builder_tag = None
+            return False  # Cannot proceed
+
+        if self.worker_stuck.need_new_worker(worker, self.ai.time, position, self.knowledge.iteration):
+            self.print(f"Worker {worker.tag} was found stuck!")
+            self.roles.set_task(UnitTask.Reserved, worker)  # Set temp reserved for the stuck worker.
+            worker = self.get_worker_builder(position, None)
+
+        if self.has_build_order(worker):
+            self.set_worker(worker)
+            return False
+
+        d = worker.distance_to(position)
+        time = d / to_new_ticks(worker.movement_speed)
+
+        if self.last_iteration_moved >= self.knowledge.iteration - 1:
+            # stop indecisiveness
+            time += 5
+
+        unit = self.ai._game_data.units[self.unit_type.value]
+        cost = self.ai._game_data.calculate_ability_cost(unit.creation_ability)
+
+        wait_time = self.prequisite_progress()
+
+        adjusted_income = self.income_calculator.mineral_income * 0.93  # 14 / 15 = 0.933333
+
+        if self.knowledge.can_afford(self.unit_type, check_supply_cost=False):
+            if wait_time <= 0:
+                self.set_worker(worker)
+                if worker.tag not in self.ai.unit_tags_received_action and not self.has_build_order(worker):
                     # No duplicate builds
-                    and not self.has_build_order(worker)
-                    # Psionic matrix ready
-                    and (
-                        self.knowledge.my_race != Race.Protoss
-                        or self.unit_type == UnitTypeId.PYLON
-                        or self.ai.state.psionic_matrix.covers(position)
-                    )
-            ):
-                # order the build (now pending)
-                worker.build(self.unit_type, position, queue=True)
-                # remove it from planned
-                self.planned_positions_workers.pop(position)
-                # track the worker for role maintenance
-                self.active_builders.add(worker.tag)
-                # make sure it doesn't get selected for another position
-                self.roles.set_task(UnitTask.Building, worker)
-                # assign rest of planned buildings to the same worker
-                if not self.multiple_builders:
-                    for pos in self.planned_positions_workers:
-                        self.planned_positions_workers[pos] = worker.tag
+                    if self.knowledge.my_race == Race.Protoss:
+                        await self.build_protoss(worker, count, position)
+                    elif self.knowledge.my_race == Race.Terran:
+                        await self.build_terran(worker, count, position)
+                    else:
+                        await self.build_zerg(worker, count, position)
+                return False
 
-            # pre-move worker and reserve resources
-            elif self.priority and not self.has_build_order(worker):
-                # calculate earliest can build
-                # tech
-                tech_wait_time = self.prerequisite_completion_time()
-                # travel
-                d = worker.distance_to(position)
-                travel_time: float = d / to_new_ticks(worker.movement_speed)
-                # minerals/gas
-                cost = self.knowledge.ai.calculate_cost(self.unit_type)
-                adjusted_income = self.income_calculator.mineral_income * 0.93  # 14 / 15 = 0.933333
-                available_minerals = self.knowledge.ai.minerals if self.override_reserved else self.knowledge.available_minerals
-                minerals_to_collect = max(0.0, cost.minerals - available_minerals)
-                minerals_wait_time = minerals_to_collect / max(adjusted_income, 0.01)
-                available_gas = self.knowledge.ai.vespene if self.override_reserved else self.knowledge.available_gas
-                gas_to_collect = max(0.0, cost.vespene - available_gas)
-                gas_wait_time = gas_to_collect / max(self.income_calculator.gas_income, 0.01)
-                # psionic matrix
-                if self.knowledge.my_race == Race.Protoss and self.unit_type not in {UnitTypeId.PYLON,
-                                                                                     UnitTypeId.NEXUS}:
-                    pending_pylons = self.cache.own(UnitTypeId.PYLON).not_ready.closer_than(7.0, position)
-                    matrix_wait_time = min([(1 - p.build_progress) * 18.0 for p in pending_pylons] + [1000])
-                else:
-                    matrix_wait_time = 0.0
-                # max
-                build_wait_time = max(travel_time, tech_wait_time, minerals_wait_time, gas_wait_time, matrix_wait_time)
-
-                # make the reservation
-                if self.multiple_builders:
-                    self.knowledge.reserve(cost.minerals, cost.vespene, build_wait_time, self.unit_type)
-                else:
-                    # reserve additional resources for single worker
-                    for i in range(len(self.planned_positions_workers)):
-                        self.knowledge.reserve(cost.minerals, cost.vespene, build_wait_time + i, self.unit_type)
-
-                # assign the worker
-                if build_wait_time < travel_time + 0.1:
-                    self.planned_positions_workers[position] = worker.tag
-                    if not self.multiple_builders:
-                        for pos in self.planned_positions_workers:
-                            self.planned_positions_workers[pos] = worker.tag
-                # pre-move and manage role
-                if self.planned_positions_workers[position] == worker.tag:  # separate condition prevents waffling
-                    # track the worker for role maintenance
-                    self.active_builders.add(worker.tag)
-                    # make sure it doesn't get selected for another position
-                    self.roles.set_task(UnitTask.Building, worker)
-                    # pre-move
+            if self.priority and wait_time < time:
+                # Go wait
+                self.set_worker(worker)
+                self.knowledge.reserve(cost.minerals, cost.vespene)
+                if not self.has_build_order(worker):
                     worker.move(self.adjust_build_to_move(position))
+                    self.last_iteration_moved = self.knowledge.iteration
 
-        # assign workers to each position (tuples: (position, worker_tag))
-        # for each position, worker
-            # do the normal stuff?
-            # if position is invalid, change the position
+        elif self.priority and wait_time < time:
+            available_minerals = self.ai.minerals - self.knowledge.reserved_minerals
+            available_gas = self.ai.vespene - self.knowledge.reserved_gas
 
-        # maintain active builder roles
-        for builder_tag in self.active_builders:
-            self.roles.set_task(UnitTask.Building, self.cache.by_tag(builder_tag))
+            if self.consider_worker_production and adjusted_income > 0:
+                for town_hall in self.ai.townhalls:  # type: Unit
+                    # TODO: Zerg(?)
+                    if town_hall.orders:
+                        starting_next_probe_in = -50 / adjusted_income
+                        order = town_hall.orders[0]  # Only consider first order
+                        if order.ability.id in worker_trainers:
+                            starting_next_probe_in += 12 * (1 - order.progress)
+
+                        if starting_next_probe_in < time:
+                            available_minerals -= 50  # should start producing workers soon now
+                    else:
+                        available_minerals -= 50  # should start producing workers soon now
+
+            if (
+                available_minerals + time * adjusted_income >= cost.minerals
+                and available_gas + time * self.income_calculator.gas_income >= cost.vespene
+            ):
+                # Go wait
+                self.set_worker(worker)
+                self.knowledge.reserve(cost.minerals, cost.vespene)
+
+                if not self.has_build_order(worker):
+                    worker.move(self.adjust_build_to_move(position))
+                    self.last_iteration_moved = self.knowledge.iteration
 
         return False
-
-    def plan_positions(self):
-        """Find valid potential positions and plan them"""
-        pending_and_existing_count = self.get_count(self.unit_type, include_pending=True, include_not_ready=True)
-        count_to_plan = self.to_count - pending_and_existing_count
-
-        buildings = self.ai.structures
-
-        # establish race-specific criteria
-        def zerg_check(pos: Point2) -> bool:
-            creep = self.ai.state.creep
-            return self.is_on_creep(creep, pos)
-
-        def protoss_check(pos: Point2) -> bool:
-            matrix = self.ai.state.psionic_matrix
-            pending_pylons = self.cache.own(UnitTypeId.PYLON).not_ready
-            return (
-                self.unit_type == UnitTypeId.PYLON
-                or matrix.covers(pos)
-                or (pending_pylons and pos.distance_to_closest(pending_pylons) <= 7)
-            )
-
-        def terran_check(pos: Point2) -> bool:
-            # If a structure is landing here from AddonSwap() then dont use this location
-            reserved_landing_locations: Set[Point2] = set(
-                self.building_solver.structure_target_move_location.values())
-            # If this location has a techlab or reactor next to it, then don't create a new structure here
-            free_addon_locations: Set[Point2] = set(self.building_solver.free_addon_locations)
-            return pos not in reserved_landing_locations and pos not in free_addon_locations
-
-        valid_for_my_race: Callable[[Point2], bool] = lambda pos: True
-        if self.knowledge.my_race == Race.Zerg:
-            valid_for_my_race = zerg_check
-        elif self.knowledge.my_race == Race.Protoss:
-            valid_for_my_race = protoss_check
-        elif self.knowledge.my_race == Race.Terran:
-            valid_for_my_race = terran_check
-
-        # find valid positions
-        while len(self.planned_positions_workers) < count_to_plan:
-            # verify potential positions left
-            if not self.potential_positions:
-                self.print(f"Can't find free position to build {self.unit_type.name} in!")
-                return
-            # check the next candidate
-            candidate_position = self.potential_positions.pop(0)
-            if buildings.closer_than(1, candidate_position) or not valid_for_my_race(candidate_position):
-                continue
-            # plan the candidate
-            self.planned_positions_workers[candidate_position] = None
-
-    def get_potential_positions(self):
-        if self.unit_type in {UnitTypeId.PYLON, UnitTypeId.SUPPLYDEPOT}:
-            return self.building_solver.buildings2x2
-        else:
-            return self.building_solver.buildings3x3
 
     def adjust_build_to_move(self, position: Point2) -> Point2:
         closest_zone: Optional[Point2] = None
@@ -351,6 +226,125 @@ class GridBuilding(ActBuilding):
 
         return position.towards(closest_zone, 1)
 
+    async def debug_actions(self):
+        if self.builder_tag is not None:
+            worker: Unit = self.cache.by_tag(self.builder_tag)
+
+            if worker and worker.orders:
+                moving_status = ""
+                for order in worker.orders:
+                    if moving_status != "":
+                        moving_status += ", "
+                    moving_status += order.ability.id.name
+                self.client.debug_text_world(moving_status, worker.position3d)
+
+    def set_worker(self, worker: Optional[Unit]) -> bool:
+        if worker:
+            self.roles.set_task(UnitTask.Building, worker)
+            self.builder_tag = worker.tag
+            return True
+
+        self.builder_tag = None
+        return False
+
+    def clear_worker(self):
+        if self.builder_tag is not None:
+            self.roles.clear_task(self.builder_tag)
+            self.builder_tag = None
+
+    def position_protoss(self, count) -> Optional[Point2]:
+        is_pylon = self.unit_type == UnitTypeId.PYLON
+        buildings = self.ai.structures
+        matrix = self.ai.state.psionic_matrix
+        future_position = None
+
+        iterator = self.get_iterator(is_pylon, count)
+
+        if is_pylon:
+            for point in self.building_solver.buildings2x2[::iterator]:
+                if not buildings.closer_than(1, point):
+                    return point
+        else:
+            pylons = self.cache.own(UnitTypeId.PYLON).not_ready
+            for point in self.building_solver.buildings3x3[::iterator]:
+                if not self.allow_wall:
+                    if point in self.building_solver.wall3x3:
+                        continue
+                if not buildings.closer_than(1, point) and matrix.covers(point):
+                    return point
+
+                if future_position is None and pylons and point.distance_to_closest(pylons) <= 7:
+                    future_position = point
+
+        return future_position
+
+    def position_zerg(self, count) -> Optional[Point2]:
+        buildings = self.ai.structures
+        creep = self.ai.state.creep
+        future_position = None
+
+        for point in self.building_solver.buildings3x3:
+            if not buildings.closer_than(1, point) and self.is_on_creep(creep, point):
+                return point
+
+        return future_position
+
+    def position_terran(self, count) -> Optional[Point2]:
+        is_depot = self.unit_type == UnitTypeId.SUPPLYDEPOT
+        buildings = self.ai.structures
+        future_position = None
+
+        if is_depot:
+            for point in self.building_solver.buildings2x2:
+                if not buildings.closer_than(1, point):
+                    return point
+        else:
+            pylons = self.cache.own(UnitTypeId.PYLON).not_ready
+            reserved_landing_locations: Set[Point2] = set(self.building_solver.structure_target_move_location.values())
+            for point in self.building_solver.buildings3x3:
+                if not self.allow_wall:
+                    if point in self.building_solver.wall3x3:
+                        continue
+                # If a structure is landing here from AddonSwap() then dont use this location
+                if point in reserved_landing_locations:
+                    continue
+                # If this location has a techlab or reactor next to it, then don't create a new structure here
+                if point in self.building_solver.free_addon_locations:
+                    continue
+                if not buildings.closer_than(1, point):
+                    return point
+
+                if future_position is None and pylons and point.distance_to_closest(pylons) <= 7:
+                    future_position = point
+
+        return future_position
+
+    def get_iterator(self, is_pylon, count):
+        if self.iterator is None:
+            if is_pylon and count < 14:
+                return 2
+            return 1
+
+        return self.iterator
+
+    async def build_protoss(self, worker: Unit, count, position: Point2):
+        if self.has_build_order(worker):
+            # TODO: is this correct?
+            worker.build(self.unit_type, position, queue=True)
+
+        # TODO: Remake the error handling with frame delay
+        worker.build(self.unit_type, position)
+
+    async def build_zerg(self, worker: Unit, count, position: Point2):
+        # try the selected position first
+        # TODO: Remake the error handling with frame delay
+        worker.build(self.unit_type, position)
+
+    async def build_terran(self, worker: Unit, count, position: Point2):
+        # try the selected position first
+        # TODO: Remake the error handling with frame delay
+        worker.build(self.unit_type, position)
+
     def is_on_creep(self, creep: PixelMap, point: Point2) -> bool:
         x_original = floor(point.x) - 1
         y_original = floor(point.y) - 1
@@ -360,7 +354,7 @@ class GridBuilding(ActBuilding):
                     return False
         return True
 
-    def prerequisite_completion_time(self) -> float:
+    def prequisite_progress(self) -> float:
         """ Return progress in realtime seconds """
         # Protoss:
         if self.unit_type == UnitTypeId.GATEWAY or self.unit_type == UnitTypeId.FORGE:
